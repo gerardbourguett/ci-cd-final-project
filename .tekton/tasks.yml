@@ -2,56 +2,95 @@
 apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
-  name: cleanup
+  name: git-clone
 spec:
-  description: This task will clean up a workspace by deleting all the files.
+  description: Clone a git repository
   workspaces:
     - name: source
+  params:
+    - name: url
+      description: Repository URL
+      type: string
+    - name: revision
+      description: Git revision
+      type: string
+      default: main
   steps:
-    - name: remove
-      image: alpine:3
-      env:
-        - name: WORKSPACE_SOURCE_PATH
-          value: $(workspaces.source.path)
+    - name: clone
+      image: alpine/git:latest
       workingDir: $(workspaces.source.path)
-      securityContext:
-        runAsNonRoot: false
-        runAsUser: 0
       script: |
-            set -eu
-            echo "Removing all files from ${WORKSPACE_SOURCE_PATH} ..."
-            # Delete any existing contents of the directory if it exists.
-            #
-            # We don't just "rm -rf ${WORKSPACE_SOURCE_PATH}" because ${WORKSPACE_SOURCE_PATH} might be "/"
-            # or the root of a mounted volume.
-            if [ -d "${WORKSPACE_SOURCE_PATH}" ] ; then
-              # Delete non-hidden files and directories
-              rm -rf "${WORKSPACE_SOURCE_PATH:?}"/*
-              # Delete files and directories starting with . but excluding ..
-              rm -rf "${WORKSPACE_SOURCE_PATH}"/.[!.]*
-              # Delete files and directories starting with .. plus any other character
-              rm -rf "${WORKSPACE_SOURCE_PATH}"/..?*
-            fi
+        set -e
+        git clone --depth 1 --branch $(params.revision) $(params.url) .
 
 ---
 apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
-  name: nose
+  name: flake8
 spec:
+  description: Lint Python code with flake8
   workspaces:
     - name: source
   params:
     - name: args
-      description: Arguments to pass to nose
+      description: Arguments to pass to flake8
       type: string
-      default: "-v"
+      default: "--count --select=E9,F63,F7,F82 --show-source --statistics"
   steps:
-    - name: nosetests 
+    - name: lint
       image: python:3.9-slim
       workingDir: $(workspaces.source.path)
       script: |
         set -e
-        python -m pip install --upgrade pip wheel
-        pip install -r requirements.txt
-        nosetests $(params.args)
+        python -m pip install --upgrade pip
+        pip install flake8
+        flake8 . $(params.args)
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildah
+spec:
+  description: Build a container image using Buildah
+  workspaces:
+    - name: source
+  params:
+    - name: image-name
+      description: Image name
+      type: string
+    - name: dockerfile
+      description: Path to Dockerfile
+      type: string
+      default: Dockerfile
+  steps:
+    - name: build
+      image: quay.io/buildah/stable:latest
+      workingDir: $(workspaces.source.path)
+      securityContext:
+        privileged: true
+      script: |
+        set -e
+        buildah bud -f $(params.dockerfile) -t $(params.image-name) .
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: oc-deploy
+spec:
+  description: Deploy application to OpenShift
+  params:
+    - name: app-name
+      description: Application name
+      type: string
+    - name: build-image
+      description: Built image
+      type: string
+  steps:
+    - name: deploy
+      image: quay.io/openshift/origin-cli:latest
+      script: |
+        set -e
+        oc create deployment $(params.app-name) --image=$(params.build-image) --dry-run=client -o yaml | oc apply -f -
